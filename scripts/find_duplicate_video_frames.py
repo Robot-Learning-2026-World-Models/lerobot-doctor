@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find bit-identical duplicate video frames in a local LeRobot dataset."""
+"""Find duplicate video frames in a local or Hugging Face LeRobot dataset."""
 
 from __future__ import annotations
 
@@ -46,9 +46,9 @@ class EpisodeStats:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Traverse local LeRobot video episodes frame-by-frame, convert frames "
-            "to uint8 numpy arrays, and report consecutive bit-identical frames "
-            "using XOR diffs."
+            "Traverse LeRobot video episodes frame-by-frame and report consecutive "
+            "duplicate frames. Default comparison converts frames to int32 and "
+            "subtracts them; --bitperfect uses uint8 XOR instead."
         )
     )
     parser.add_argument("dataset", help="Local dataset root or Hugging Face dataset repo id, e.g. org/name")
@@ -56,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--features", nargs="+", default=None, help="Video feature names to inspect; default all")
     parser.add_argument("--max-episodes", type=int, default=None, help="Only inspect first N episode indices")
     parser.add_argument("--max-examples", type=int, default=200, help="Max duplicate runs printed to terminal")
+    parser.add_argument("--bitperfect", action="store_true", help="Use uint8 XOR instead of default int32 subtraction")
     parser.add_argument("--json-out", type=Path, default=None, help="Optional JSON report path")
     args = parser.parse_args(argv)
 
@@ -78,11 +79,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Dataset: {root}")
     print(f"FPS: {fps}")
     print(f"Features: {', '.join(video_features)}")
+    diff_mode = "uint8-xor" if args.bitperfect else "int32-subtract"
     print(f"Video chunks: {len(windows_by_path)}")
+    print(f"Diff mode: {diff_mode}")
     print()
 
-    stats = _scan_windows(windows_by_path)
-    report = _summarize(stats)
+    stats = _scan_windows(windows_by_path, bitperfect=args.bitperfect)
+    report = _summarize(stats, diff_mode=diff_mode)
     _print_report(report, args.max_examples)
 
     if args.json_out is not None:
@@ -208,7 +211,7 @@ def _format_video_path(template: str, feature: str, chunk_idx: int, file_idx: in
         raise SystemExit(f"Could not resolve video_path template: {template}") from exc
 
 
-def _scan_windows(windows_by_path: dict[Path, list[EpisodeWindow]]) -> list[EpisodeStats]:
+def _scan_windows(windows_by_path: dict[Path, list[EpisodeWindow]], bitperfect: bool) -> list[EpisodeStats]:
     try:
         import av
     except ImportError as exc:
@@ -243,7 +246,7 @@ def _scan_windows(windows_by_path: dict[Path, list[EpisodeWindow]]) -> list[Epis
                     continue
 
                 arr = frame.to_ndarray(format="rgb24")
-                _consume_frame(stats_by_key[(current.feature, current.episode_index)], arr)
+                _consume_frame(stats_by_key[(current.feature, current.episode_index)], arr, bitperfect)
 
             while current is not None:
                 _finish_window(stats_by_key[(current.feature, current.episode_index)], current)
@@ -258,12 +261,15 @@ def _scan_windows(windows_by_path: dict[Path, list[EpisodeWindow]]) -> list[Epis
     return all_stats
 
 
-def _consume_frame(stats: EpisodeStats, arr: np.ndarray):
+def _consume_frame(stats: EpisodeStats, arr: np.ndarray, bitperfect: bool):
     arr = np.asarray(arr, dtype=np.uint8)
     prev = getattr(stats, "_prev", None)
     duplicate = False
     if prev is not None:
-        duplicate = not bool(np.bitwise_xor(prev, arr).any())
+        if bitperfect:
+            duplicate = not bool(np.bitwise_xor(prev, arr).any())
+        else:
+            duplicate = not bool((arr.astype(np.int32) - prev.astype(np.int32)).any())
 
     frame_index = stats.frames_seen
     if duplicate:
@@ -297,7 +303,7 @@ def _finish_window(stats: EpisodeStats, window: EpisodeWindow):
         delattr(stats, "_prev")
 
 
-def _summarize(stats: list[EpisodeStats]) -> dict[str, Any]:
+def _summarize(stats: list[EpisodeStats], diff_mode: str) -> dict[str, Any]:
     duplicate_runs = [run for item in stats for run in item.duplicate_runs]
     warnings = [
         {"feature": item.feature, "episode_index": item.episode_index, "warning": warning}
@@ -305,6 +311,7 @@ def _summarize(stats: list[EpisodeStats]) -> dict[str, Any]:
         for warning in item.warnings
     ]
     return {
+        "diff_mode": diff_mode,
         "episodes_scanned": len(stats),
         "frames_scanned": sum(item.frames_seen for item in stats),
         "duplicate_frames": sum(item.duplicate_frames for item in stats),
@@ -328,6 +335,7 @@ def _summarize(stats: list[EpisodeStats]) -> dict[str, Any]:
 def _print_report(report: dict[str, Any], max_examples: int):
     print()
     print("Summary")
+    print(f"  Diff mode:              {report['diff_mode']}")
     print(f"  Episode windows scanned: {report['episodes_scanned']}")
     print(f"  Frames scanned:          {report['frames_scanned']}")
     print(f"  Duplicate frames:       {report['duplicate_frames']}")
