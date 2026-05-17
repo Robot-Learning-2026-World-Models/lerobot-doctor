@@ -47,6 +47,53 @@ def test_cli_nonexistent_path(capsys):
     assert exc_info.value.code == 1
 
 
+def test_cli_trim_nonexistent_path(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["trim", "rl26-world-models/so101-task1-720p-whole-arm", "--dry-run"])
+    captured = capsys.readouterr()
+
+    assert exc_info.value.code == 1
+    assert "trim expects a local dataset path" in captured.err
+
+
+def test_cli_trim_missing_data_dir(tmp_path, capsys):
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["trim", str(dataset), "--dry-run"])
+    captured = capsys.readouterr()
+
+    assert exc_info.value.code == 1
+    assert "missing a data/ directory" in captured.err
+
+
+def test_cli_hf_repo_not_found_message(monkeypatch, capsys):
+    import httpx
+    from huggingface_hub.errors import RepositoryNotFoundError
+
+    from lerobot_doctor import dataset_loader
+
+    def fake_load_dataset(path_or_repo, max_episodes=None):
+        raise RuntimeError(dataset_loader._format_hf_load_error(
+            path_or_repo,
+            RepositoryNotFoundError(
+                "not found",
+                response=httpx.Response(404, request=httpx.Request("GET", "https://huggingface.co")),
+            ),
+        ))
+
+    monkeypatch.setattr(dataset_loader, "load_dataset", fake_load_dataset)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["rl26-world-models/so101-task1-720p-whole-arm"])
+    captured = capsys.readouterr()
+
+    assert exc_info.value.code == 1
+    assert "Hugging Face dataset 'rl26-world-models/so101-task1-720p-whole-arm'" in captured.err
+    assert "hf auth whoami" in captured.err
+
+
 def test_cli_version(capsys):
     with pytest.raises(SystemExit) as exc_info:
         main(["--version"])

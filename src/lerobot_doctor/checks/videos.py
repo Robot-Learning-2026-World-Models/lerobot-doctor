@@ -63,6 +63,7 @@ def _check_video_feature(
     fps_mismatches = []
     resolution_mismatches = []
     frame_count_mismatches = []
+    videos_by_path = {}
 
     for ep_meta in dataset.episodes_meta:
         ep_idx = ep_meta.episode_index
@@ -94,6 +95,11 @@ def _check_video_feature(
             missing_videos.append(ep_idx)
             continue
 
+        from_ts = ep_meta.raw.get(f"videos/{feat_name}/from_timestamp")
+        to_ts = ep_meta.raw.get(f"videos/{feat_name}/to_timestamp")
+        videos_by_path.setdefault(full_path, []).append((ep_idx, from_ts, to_ts))
+
+    for full_path, episode_windows in videos_by_path.items():
         checked += 1
 
         # Only do detailed checks on a sample to avoid being too slow
@@ -104,12 +110,13 @@ def _check_video_feature(
             import av
             container = av.open(str(full_path))
             stream = container.streams.video[0]
+            sample_ep = episode_windows[0][0]
 
             # Check fps
             if fps and stream.average_rate:
                 video_fps = float(stream.average_rate)
                 if abs(video_fps - fps) > 1.0:
-                    fps_mismatches.append((ep_idx, video_fps))
+                    fps_mismatches.append((sample_ep, video_fps))
 
             # Check resolution
             if expected_shape and stream.width and stream.height:
@@ -122,14 +129,19 @@ def _check_video_feature(
                             shape_matches = True
                             break
                 if not shape_matches:
-                    resolution_mismatches.append((ep_idx, h, w, expected_shape))
+                    resolution_mismatches.append((sample_ep, h, w, expected_shape))
 
-            # Check frame count vs episode metadata
+            # Check frame count vs episode metadata. LeRobot v3 commonly stores
+            # many episode windows in one larger MP4 chunk, so compare the
+            # whole chunk against the sum of its episode windows.
             if fps:
-                from_ts = ep_meta.raw.get(f"videos/{feat_name}/from_timestamp")
-                to_ts = ep_meta.raw.get(f"videos/{feat_name}/to_timestamp")
-                if from_ts is not None and to_ts is not None:
-                    expected_frames = round((to_ts - from_ts) * fps)
+                complete_windows = [
+                    (ep_idx, from_ts, to_ts)
+                    for ep_idx, from_ts, to_ts in episode_windows
+                    if from_ts is not None and to_ts is not None
+                ]
+                if complete_windows:
+                    expected_frames = round(sum((to_ts - from_ts) * fps for _, from_ts, to_ts in complete_windows))
                     # Count actual frames
                     actual_frames = stream.frames
                     if actual_frames == 0:
@@ -137,21 +149,23 @@ def _check_video_feature(
                         container.seek(0)
                         actual_frames = sum(1 for _ in container.decode(video=0))
                     if actual_frames > 0 and abs(actual_frames - expected_frames) > 2:
-                        frame_count_mismatches.append((ep_idx, actual_frames, expected_frames))
+                        first_ep = complete_windows[0][0]
+                        last_ep = complete_windows[-1][0]
+                        frame_count_mismatches.append((first_ep, last_ep, full_path.name, actual_frames, expected_frames))
 
             # Try decoding first frame to check for corruption
             container.seek(0)
             for frame in container.decode(video=0):
                 break  # just need first frame
             else:
-                decode_errors.append(ep_idx)
+                decode_errors.append(sample_ep)
 
             container.close()
         except ImportError:
             result.warn("PyAV (av) not installed -- skipping video decode checks")
             return
         except Exception as e:
-            decode_errors.append(ep_idx)
+            decode_errors.append(episode_windows[0][0])
 
     if missing_videos:
         if len(missing_videos) > 10:
@@ -176,5 +190,11 @@ def _check_video_feature(
             result.warn(f"{feat_name}: Episode {ep_idx} resolution {w}x{h} doesn't match shape {expected}")
 
     if frame_count_mismatches:
-        for ep_idx, actual, expected in frame_count_mismatches[:3]:
-            result.warn(f"{feat_name}: Episode {ep_idx} has {actual} frames, expected {expected}")
+        for first_ep, last_ep, filename, actual, expected in frame_count_mismatches[:3]:
+            if first_ep == last_ep:
+                result.warn(f"{feat_name}: Episode {first_ep} video {filename} has {actual} frames, expected {expected}")
+            else:
+                result.warn(
+                    f"{feat_name}: Video chunk {filename} for episodes {first_ep}-{last_ep} "
+                    f"has {actual} frames, expected {expected}"
+                )

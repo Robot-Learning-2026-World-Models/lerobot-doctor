@@ -209,6 +209,50 @@ def load_tasks(root: Path) -> list[dict] | None:
     ]
 
 
+def _format_hf_load_error(repo_id: str, error: Exception) -> str:
+    """Return an actionable message for common HuggingFace Hub load failures."""
+    try:
+        from huggingface_hub.errors import (
+            GatedRepoError,
+            HFValidationError,
+            RepositoryNotFoundError,
+        )
+    except ImportError:  # pragma: no cover - dependency is required by package metadata
+        return str(error)
+
+    if isinstance(error, HFValidationError):
+        return (
+            f"Invalid Hugging Face dataset repo_id '{repo_id}'. Use the form "
+            "'namespace/name', for example 'lerobot/pusht'."
+        )
+
+    if isinstance(error, GatedRepoError):
+        return (
+            f"Hugging Face dataset '{repo_id}' is gated. Request access on the "
+            "dataset page, then run 'hf auth login' with a token that has access."
+        )
+
+    if isinstance(error, RepositoryNotFoundError):
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+        prefix = (
+            f"Hugging Face dataset '{repo_id}' was not found"
+            if status_code == 404
+            else f"Cannot access Hugging Face dataset '{repo_id}'"
+        )
+        return (
+            f"{prefix}. Confirm the dataset exists at "
+            f"https://huggingface.co/datasets/{repo_id}. If it is private, run "
+            "'hf auth whoami' and make sure the active fine-grained token has "
+            "read access to this dataset or its organization."
+        )
+
+    return str(error)
+
+
+def _raise_hf_load_error(repo_id: str, error: Exception) -> None:
+    raise RuntimeError(_format_hf_load_error(repo_id, error)) from error
+
+
 def load_from_hf(repo_id: str, cache_dir: Path | None = None, max_episodes: int | None = None) -> LoadedDataset:
     """Download dataset files from HuggingFace Hub and load them.
 
@@ -220,12 +264,15 @@ def load_from_hf(repo_id: str, cache_dir: Path | None = None, max_episodes: int 
 
     if max_episodes is None:
         # Full download: everything under meta/ and data/.
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            repo_type="dataset",
-            cache_dir=cache_dir,
-            allow_patterns=["meta/**", "data/**"],
-        )
+        try:
+            local_dir = snapshot_download(
+                repo_id=repo_id,
+                repo_type="dataset",
+                cache_dir=cache_dir,
+                allow_patterns=["meta/**", "data/**"],
+            )
+        except Exception as e:
+            _raise_hf_load_error(repo_id, e)
         ds = load_local(Path(local_dir), max_episodes=None)
         ds.is_local = False
         return ds
@@ -234,7 +281,11 @@ def load_from_hf(repo_id: str, cache_dir: Path | None = None, max_episodes: int 
     api = HfApi()
     try:
         all_files = api.list_repo_files(repo_id, repo_type="dataset")
-    except Exception:
+    except Exception as e:
+        from huggingface_hub.errors import RepositoryNotFoundError
+
+        if isinstance(e, RepositoryNotFoundError):
+            _raise_hf_load_error(repo_id, e)
         all_files = []
 
     root: Path | None = None
@@ -264,12 +315,15 @@ def load_from_hf(repo_id: str, cache_dir: Path | None = None, max_episodes: int 
 
     if root is None:
         # Couldn't download anything; fall back to full snapshot.
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            repo_type="dataset",
-            cache_dir=cache_dir,
-            allow_patterns=["meta/**", "data/**"],
-        )
+        try:
+            local_dir = snapshot_download(
+                repo_id=repo_id,
+                repo_type="dataset",
+                cache_dir=cache_dir,
+                allow_patterns=["meta/**", "data/**"],
+            )
+        except Exception as e:
+            _raise_hf_load_error(repo_id, e)
         ds = load_local(Path(local_dir), max_episodes=max_episodes)
         ds.is_local = False
         return ds

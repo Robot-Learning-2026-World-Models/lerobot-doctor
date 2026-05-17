@@ -44,6 +44,7 @@ def main(argv: list[str] | None = None):
     trim_p.add_argument("--threshold", type=float, default=0.01)
     trim_p.add_argument("--min-active", type=int, default=10)
     trim_p.add_argument("--keep-static", action="store_true")
+    trim_p.add_argument("--no-trim-videos", action="store_true")
     trim_p.add_argument("--dry-run", action="store_true")
 
     # === SCORE ===
@@ -150,10 +151,24 @@ def _run_trim(args):
     from pathlib import Path
     from lerobot_doctor.trim import trim_dataset
 
+    root = Path(args.dataset)
+    if not root.exists():
+        print(
+            f"Error: trim expects a local dataset path, but '{args.dataset}' does not exist. "
+            "Download the dataset locally first, then pass that directory.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not (root / "data").exists():
+        print(f"Error: '{args.dataset}' is missing a data/ directory", file=sys.stderr)
+        sys.exit(1)
+
     result = trim_dataset(
-        Path(args.dataset), action_threshold=args.threshold,
+        root, action_threshold=args.threshold,
         min_active_frames=args.min_active, remove_fully_static=not args.keep_static,
+        trim_videos=not args.no_trim_videos,
         dry_run=args.dry_run,
+        progress=(lambda msg: print(f"  {msg}", file=sys.stderr)) if not args.dry_run else None,
     )
     prefix = "[DRY RUN] " if args.dry_run else ""
     for d in result.details:
