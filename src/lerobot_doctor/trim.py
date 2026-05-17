@@ -684,8 +684,11 @@ def _update_episode_metadata(
             keep_rows.append(i)
             seen_episodes.add(ep)
         if len(keep_rows) < len(table):
-            table = table.take(keep_rows)
-            ep_col = [int(ep) for ep in table.column("episode_index").to_pylist()]
+            if keep_rows:
+                table = table.take(keep_rows)
+            else:
+                table = table.slice(0, 0)
+            ep_col = [int(ep) for ep in table.column("episode_index").to_pylist()] if len(table) else []
         if len(table) == 0:
             pq.write_table(table, pf)
             continue
