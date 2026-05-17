@@ -127,6 +127,9 @@ def _build_subsample_plan(
     table_plans: list[TableSubsamplePlan] = []
     episode_plans: dict[int, EpisodeSubsamplePlan] = {}
 
+    step = source_fps // target_fps
+    episode_offsets: dict[int, int] = {}
+
     for pf in sorted(data_dir.rglob("*.parquet")):
         table = pq.read_table(pf)
         if "episode_index" not in table.column_names:
@@ -141,21 +144,34 @@ def _build_subsample_plan(
         rows_to_keep: list[int] = []
         for ep_idx in sorted(episodes.keys()):
             row_indices = episodes[ep_idx]
-            step = source_fps // target_fps
-            kept_rows = [row for offset, row in enumerate(row_indices) if offset % step == 0]
+            start_offset = episode_offsets.get(ep_idx, 0)
+            kept_rows = [
+                row
+                for local_offset, row in enumerate(row_indices)
+                if (start_offset + local_offset) % step == 0
+            ]
+            episode_offsets[ep_idx] = start_offset + len(row_indices)
+
             old_length = len(row_indices)
             new_length = len(kept_rows)
             removed = old_length - new_length
             rows_to_keep.extend(kept_rows)
-            episode_plans[ep_idx] = EpisodeSubsamplePlan(ep_idx, old_length, new_length, kept_rows)
+            if ep_idx not in episode_plans:
+                episode_plans[ep_idx] = EpisodeSubsamplePlan(ep_idx, 0, 0, [])
+            episode_plans[ep_idx].old_length += old_length
+            episode_plans[ep_idx].new_length += new_length
+            episode_plans[ep_idx].rows_to_keep.extend(kept_rows)
             result.frames_removed += removed
-            if removed > 0:
-                result.details.append(
-                    f"Episode {ep_idx}: subsampled {old_length} -> {new_length} frames "
-                    f"({source_fps}fps -> {target_fps}fps)"
-                )
 
         table_plans.append(TableSubsamplePlan(pf, table, rows_to_keep))
+
+    for ep_idx in sorted(episode_plans):
+        plan = episode_plans[ep_idx]
+        if plan.old_length != plan.new_length:
+            result.details.append(
+                f"Episode {ep_idx}: subsampled {plan.old_length} -> {plan.new_length} frames "
+                f"({source_fps}fps -> {target_fps}fps)"
+            )
 
     return table_plans, episode_plans
 
@@ -166,30 +182,32 @@ def _apply_table_plans(
     progress: Callable[[str], None] | None = None,
 ):
     next_index = 0
+    frame_counters: dict[int, int] = {}
     total = len(table_plans)
     for i, plan in enumerate(table_plans, start=1):
         _emit(progress, f"Writing subsampled parquet {i}/{total}: {plan.path.name}")
         table = plan.table.take(plan.rows_to_keep) if len(plan.rows_to_keep) < len(plan.table) else plan.table
-        table, next_index = _reindex_table(table, target_fps, next_index)
+        table, next_index = _reindex_table(table, target_fps, next_index, frame_counters)
         pq.write_table(table, plan.path)
 
 
-def _reindex_table(table: pa.Table, fps: int, start_index: int) -> tuple[pa.Table, int]:
+def _reindex_table(
+    table: pa.Table,
+    fps: int,
+    start_index: int,
+    frame_counters: dict[int, int],
+) -> tuple[pa.Table, int]:
     if "episode_index" not in table.column_names:
         return table, start_index + len(table)
 
-    ep_col = table.column("episode_index").to_pylist()
+    ep_col = [int(ep) for ep in table.column("episode_index").to_pylist()]
     new_frames = []
     new_timestamps = []
-    current_ep = None
-    counter = 0
     for ep in ep_col:
-        if ep != current_ep:
-            current_ep = ep
-            counter = 0
+        counter = frame_counters.get(ep, 0)
         new_frames.append(counter)
         new_timestamps.append(counter / fps)
-        counter += 1
+        frame_counters[ep] = counter + 1
 
     if "frame_index" in table.column_names:
         table = table.set_column(table.column_names.index("frame_index"), "frame_index", pa.array(new_frames))

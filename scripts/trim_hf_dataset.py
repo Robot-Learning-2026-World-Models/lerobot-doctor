@@ -88,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if any(detail.startswith("Error:") for detail in subsample_result.details):
             return 1
+        print("  Subsampled dataset saved; trim will run on saved subsampled copy")
         step += 1
 
     print(f"\n[{step}/{total_steps}] Trimming parquet rows and video chunks...")
