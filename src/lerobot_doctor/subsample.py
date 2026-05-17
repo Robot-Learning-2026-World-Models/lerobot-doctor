@@ -1,4 +1,4 @@
-"""Dataset subsampling -- lower LeRobot capture FPS by keeping early frames per second."""
+"""Dataset subsampling -- lower LeRobot capture FPS by keeping an even frame cadence."""
 
 from __future__ import annotations
 
@@ -141,7 +141,8 @@ def _build_subsample_plan(
         rows_to_keep: list[int] = []
         for ep_idx in sorted(episodes.keys()):
             row_indices = episodes[ep_idx]
-            kept_rows = [row for offset, row in enumerate(row_indices) if offset % source_fps < target_fps]
+            step = source_fps // target_fps
+            kept_rows = [row for offset, row in enumerate(row_indices) if offset % step == 0]
             old_length = len(row_indices)
             new_length = len(kept_rows)
             removed = old_length - new_length
@@ -277,7 +278,8 @@ def _rewrite_video_chunks(
     use_hwaccel = _has_videotoolbox_hwaccel(ffmpeg)
 
     total = len(video_rewrites)
-    select_expr = f"lt(mod(n\\,{source_fps})\\,{target_fps})"
+    step = source_fps // target_fps
+    select_expr = f"eq(mod(n\\,{step})\\,0)"
     for chunk_i, (source_path, slices) in enumerate(video_rewrites.items(), start=1):
         if not slices:
             continue
