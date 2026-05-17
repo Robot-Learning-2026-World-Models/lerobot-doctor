@@ -71,7 +71,26 @@ def main(argv: list[str] | None = None) -> int:
     shutil.copytree(snapshot_path, local_dir, symlinks=False)
     print(f"Copied to: {local_dir}")
 
-    print(f"\n[3/{total_steps}] Trimming parquet rows and video chunks...")
+    step = 3
+    if args.subsample_fps is not None:
+        print(f"\n[{step}/{total_steps}] Subsampling original dataset to {args.subsample_fps}fps...")
+        subsample_result = subsample_dataset(
+            local_dir,
+            target_fps=args.subsample_fps,
+            progress=lambda msg: print(f"  {msg}"),
+        )
+        for detail in subsample_result.details:
+            print(f"  {detail}")
+        print(
+            f"Subsample result: {subsample_result.source_fps}fps -> "
+            f"{subsample_result.target_fps}fps, "
+            f"{subsample_result.frames_removed} frame(s) removed"
+        )
+        if any(detail.startswith("Error:") for detail in subsample_result.details):
+            return 1
+        step += 1
+
+    print(f"\n[{step}/{total_steps}] Trimming parquet rows and video chunks...")
     trim_result = trim_dataset(
         local_dir,
         action_threshold=args.threshold,
@@ -87,23 +106,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     if any(detail.startswith("Error:") for detail in trim_result.details):
         return 1
-
-    if args.subsample_fps is not None:
-        print(f"\n[4/{total_steps}] Subsampling dataset to {args.subsample_fps}fps...")
-        subsample_result = subsample_dataset(
-            local_dir,
-            target_fps=args.subsample_fps,
-            progress=lambda msg: print(f"  {msg}"),
-        )
-        for detail in subsample_result.details:
-            print(f"  {detail}")
-        print(
-            f"Subsample result: {subsample_result.source_fps}fps -> "
-            f"{subsample_result.target_fps}fps, "
-            f"{subsample_result.frames_removed} frame(s) removed"
-        )
-        if any(detail.startswith("Error:") for detail in subsample_result.details):
-            return 1
 
     print(f"\n[{total_steps - 1}/{total_steps}] Running health checks...")
     dataset = load_local(local_dir)
