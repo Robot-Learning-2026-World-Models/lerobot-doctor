@@ -406,11 +406,25 @@ def _update_episode_metadata(
         global_from[ep_idx] = cursor
         cursor += plan.new_length
 
+    seen_episodes: set[int] = set()
     for pf in sorted(meta_dir.rglob("*.parquet")):
         table = pq.read_table(pf)
         if "episode_index" not in table.column_names:
             continue
         ep_col = [int(ep) for ep in table.column("episode_index").to_pylist()]
+        keep_rows = []
+        for i, ep in enumerate(ep_col):
+            if ep in seen_episodes:
+                continue
+            keep_rows.append(i)
+            seen_episodes.add(ep)
+        if len(keep_rows) < len(table):
+            table = table.take(keep_rows)
+            ep_col = [int(ep) for ep in table.column("episode_index").to_pylist()]
+        if len(table) == 0:
+            pq.write_table(table, pf)
+            continue
+
         updates: dict[str, list] = {}
         if "length" in table.column_names:
             updates["length"] = [

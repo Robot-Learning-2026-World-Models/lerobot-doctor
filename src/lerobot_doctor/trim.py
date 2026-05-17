@@ -126,32 +126,46 @@ def _build_trim_plan(
     fps: int | None,
     result: TrimResult,
 ) -> tuple[list[TableTrimPlan], dict[int, EpisodeTrimPlan]]:
-    table_plans: list[TableTrimPlan] = []
-    episode_plans: dict[int, EpisodeTrimPlan] = {}
+    tables: list[tuple[Path, pa.Table]] = []
+    episode_entries: dict[int, list[tuple[int, int]]] = {}
+    table_rows_to_keep: list[list[int]] = []
 
     for pf in sorted(data_dir.rglob("*.parquet")):
         table = pq.read_table(pf)
-        if "episode_index" not in table.column_names:
-            continue
+        table_idx = len(tables)
+        tables.append((pf, table))
+        table_rows_to_keep.append([])
 
-        action_cols = [c for c in table.column_names if c.startswith("action")]
-        if not action_cols:
-            table_plans.append(TableTrimPlan(pf, table, list(range(len(table)))))
+        if "episode_index" not in table.column_names:
+            table_rows_to_keep[table_idx].extend(range(len(table)))
             continue
 
         ep_col = table.column("episode_index").to_pylist()
-        episodes: dict[int, list[int]] = {}
-        for i, ep in enumerate(ep_col):
-            episodes.setdefault(int(ep), []).append(i)
+        for row_idx, ep in enumerate(ep_col):
+            episode_entries.setdefault(int(ep), []).append((table_idx, row_idx))
 
-        rows_to_keep: list[int] = []
-        for ep_idx in sorted(episodes.keys()):
-            row_indices = episodes[ep_idx]
-            plan = _plan_episode(
-                table,
-                pf,
+    episode_plans: dict[int, EpisodeTrimPlan] = {}
+    for ep_idx in sorted(episode_entries):
+        entries = episode_entries[ep_idx]
+        first_path = tables[entries[0][0]][0]
+        action_cols = _action_cols_for_entries(tables, entries)
+        if not action_cols:
+            plan = EpisodeTrimPlan(
                 ep_idx,
-                row_indices,
+                first_path,
+                len(entries),
+                0,
+                len(entries),
+                len(entries),
+                0,
+                *_source_time_bounds_entries(tables, entries, 0, len(entries), fps),
+            )
+        else:
+            plan = _plan_episode_entries(
+                tables,
+                first_path,
+                ep_idx,
+                entries,
                 action_cols,
                 action_threshold,
                 min_active_frames,
@@ -160,26 +174,140 @@ def _build_trim_plan(
                 remove_fully_static,
                 fps,
             )
-            episode_plans[ep_idx] = plan
+        episode_plans[ep_idx] = plan
 
-            if plan.dropped:
-                result.episodes_removed += 1
-                result.frames_removed += plan.old_length
-                result.details.append(f"Episode {ep_idx}: removed (fully static)")
-                continue
+        if plan.dropped:
+            result.episodes_removed += 1
+            result.frames_removed += plan.old_length
+            result.details.append(f"Episode {ep_idx}: removed (fully static)")
+            continue
 
-            rows_to_keep.extend(row_indices[plan.start:plan.end])
-            if plan.removed > 0:
-                result.episodes_trimmed += 1
-                result.frames_removed += plan.removed
-                result.details.append(
-                    f"Episode {ep_idx}: trimmed {plan.removed} idle frames "
-                    f"({plan.old_length} -> {plan.new_length})"
-                )
+        for table_idx, row_idx in entries[plan.start:plan.end]:
+            table_rows_to_keep[table_idx].append(row_idx)
+        if plan.removed > 0:
+            result.episodes_trimmed += 1
+            result.frames_removed += plan.removed
+            result.details.append(
+                f"Episode {ep_idx}: trimmed {plan.removed} idle frames "
+                f"({plan.old_length} -> {plan.new_length})"
+            )
 
-        table_plans.append(TableTrimPlan(pf, table, rows_to_keep))
-
+    table_plans = [
+        TableTrimPlan(path, table, sorted(rows_to_keep))
+        for (path, table), rows_to_keep in zip(tables, table_rows_to_keep)
+    ]
     return table_plans, episode_plans
+
+
+def _action_cols_for_entries(
+    tables: list[tuple[Path, pa.Table]],
+    entries: list[tuple[int, int]],
+) -> list[str]:
+    for table_idx, _ in entries:
+        table = tables[table_idx][1]
+        cols = [c for c in table.column_names if c.startswith("action")]
+        if cols:
+            return cols
+    return []
+
+
+def _plan_episode_entries(
+    tables: list[tuple[Path, pa.Table]],
+    parquet_path: Path,
+    ep_idx: int,
+    entries: list[tuple[int, int]],
+    action_cols: list[str],
+    action_threshold: float,
+    min_active_frames: int,
+    trim_start: bool,
+    trim_end: bool,
+    remove_fully_static: bool,
+    fps: int | None,
+) -> EpisodeTrimPlan:
+    old_length = len(entries)
+    action_matrix = _action_matrix_entries(tables, entries, action_cols)
+    if action_matrix is None or len(action_matrix) < 2:
+        source_start_ts, source_end_ts = _source_time_bounds_entries(tables, entries, 0, old_length, fps)
+        return EpisodeTrimPlan(
+            ep_idx, parquet_path, old_length, 0, old_length, old_length, 0, source_start_ts, source_end_ts
+        )
+
+    diffs = np.abs(np.diff(action_matrix, axis=0))
+    activity = np.concatenate([[0], diffs.mean(axis=1)])
+    active_indices = np.where(activity > action_threshold)[0]
+
+    if len(active_indices) < min_active_frames:
+        if remove_fully_static:
+            return EpisodeTrimPlan(ep_idx, parquet_path, old_length, 0, 0, 0, old_length, 0.0, 0.0, dropped=True)
+        source_start_ts, source_end_ts = _source_time_bounds_entries(tables, entries, 0, old_length, fps)
+        return EpisodeTrimPlan(
+            ep_idx, parquet_path, old_length, 0, old_length, old_length, 0, source_start_ts, source_end_ts
+        )
+
+    start = int(active_indices[0]) if trim_start else 0
+    end = int(active_indices[-1]) + 1 if trim_end else old_length
+    new_length = end - start
+    source_start_ts, source_end_ts = _source_time_bounds_entries(tables, entries, start, end, fps)
+    return EpisodeTrimPlan(
+        ep_idx,
+        parquet_path,
+        old_length,
+        start,
+        end,
+        new_length,
+        old_length - new_length,
+        source_start_ts,
+        source_end_ts,
+    )
+
+
+def _source_time_bounds_entries(
+    tables: list[tuple[Path, pa.Table]],
+    entries: list[tuple[int, int]],
+    start: int,
+    end: int,
+    fps: int | None,
+) -> tuple[float, float]:
+    if end <= start:
+        return 0.0, 0.0
+    start_table = tables[entries[start][0]][1]
+    end_table = tables[entries[end - 1][0]][1]
+    start_row = entries[start][1]
+    end_row = entries[end - 1][1]
+    if "timestamp" in start_table.column_names and "timestamp" in end_table.column_names:
+        start_ts = float(start_table.column("timestamp")[start_row].as_py())
+        last_ts = float(end_table.column("timestamp")[end_row].as_py())
+        frame_dt = (1.0 / fps) if fps else 0.0
+        return start_ts, last_ts + frame_dt
+    if fps:
+        return start / fps, end / fps
+    return float(start), float(end)
+
+
+def _action_matrix_entries(
+    tables: list[tuple[Path, pa.Table]],
+    entries: list[tuple[int, int]],
+    action_cols: list[str],
+) -> np.ndarray | None:
+    actions = []
+    for col in action_cols:
+        try:
+            vals = np.array([
+                tables[table_idx][1].column(col)[row_idx].as_py()
+                for table_idx, row_idx in entries
+            ], dtype=np.float64)
+        except (KeyError, ValueError, TypeError):
+            continue
+        if vals.ndim == 1:
+            vals = vals.reshape(-1, 1)
+        elif vals.ndim > 1:
+            vals = vals.reshape(len(entries), -1)
+        else:
+            continue
+        actions.append(vals)
+    if not actions:
+        return None
+    return np.concatenate(actions, axis=1)
 
 
 def _plan_episode(
@@ -273,30 +401,32 @@ def _action_matrix(table: pa.Table, row_indices: list[int], action_cols: list[st
 
 def _apply_table_plans(table_plans: list[TableTrimPlan], fps: int, progress: Callable[[str], None] | None = None):
     next_index = 0
+    frame_counters: dict[int, int] = {}
     total = len(table_plans)
     for i, plan in enumerate(table_plans, start=1):
         _emit(progress, f"Writing parquet {i}/{total}: {plan.path.name}")
         table = plan.table.take(plan.rows_to_keep) if len(plan.rows_to_keep) < len(plan.table) else plan.table
-        table, next_index = _reindex_table(table, fps, next_index)
+        table, next_index = _reindex_table(table, fps, next_index, frame_counters)
         pq.write_table(table, plan.path)
 
 
-def _reindex_table(table: pa.Table, fps: int, start_index: int) -> tuple[pa.Table, int]:
+def _reindex_table(
+    table: pa.Table,
+    fps: int,
+    start_index: int,
+    frame_counters: dict[int, int],
+) -> tuple[pa.Table, int]:
     if "episode_index" not in table.column_names:
         return table, start_index + len(table)
 
-    ep_col = table.column("episode_index").to_pylist()
+    ep_col = [int(ep) for ep in table.column("episode_index").to_pylist()]
     new_frames = []
     new_timestamps = []
-    current_ep = None
-    counter = 0
     for ep in ep_col:
-        if ep != current_ep:
-            current_ep = ep
-            counter = 0
+        counter = frame_counters.get(ep, 0)
         new_frames.append(counter)
         new_timestamps.append(counter / fps)
-        counter += 1
+        frame_counters[ep] = counter + 1
 
     if "frame_index" in table.column_names:
         table = table.set_column(table.column_names.index("frame_index"), "frame_index", pa.array(new_frames))
@@ -538,12 +668,21 @@ def _update_episode_metadata(
         global_from[ep_idx] = cursor
         cursor += plan.new_length
 
+    seen_episodes: set[int] = set()
     for pf in sorted(meta_dir.rglob("*.parquet")):
         table = pq.read_table(pf)
         if "episode_index" not in table.column_names:
             continue
         ep_col = [int(ep) for ep in table.column("episode_index").to_pylist()]
-        keep_rows = [i for i, ep in enumerate(ep_col) if ep not in episode_plans or not episode_plans[ep].dropped]
+        keep_rows = []
+        for i, ep in enumerate(ep_col):
+            if ep in seen_episodes:
+                continue
+            if ep in episode_plans and episode_plans[ep].dropped:
+                seen_episodes.add(ep)
+                continue
+            keep_rows.append(i)
+            seen_episodes.add(ep)
         if len(keep_rows) < len(table):
             table = table.take(keep_rows)
             ep_col = [int(ep) for ep in table.column("episode_index").to_pylist()]
