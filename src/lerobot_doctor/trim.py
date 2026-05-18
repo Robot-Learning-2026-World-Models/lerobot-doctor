@@ -698,6 +698,7 @@ def _rewrite_video_chunks(
             "-fps_mode", "passthrough",
             "-c:v", encoder,
             "-pix_fmt", "yuv420p",
+            "-bf", "0",
             "-threads", str(ffmpeg_threads),
         ])
         if "hevc" in encoder or "x265" in encoder:
