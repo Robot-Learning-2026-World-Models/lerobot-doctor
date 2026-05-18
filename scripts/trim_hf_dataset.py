@@ -98,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         local_dir,
         action_threshold=args.threshold,
         min_active_frames=args.min_active,
+        workers=args.workers,
         progress=lambda msg: print(f"  {msg}"),
     )
     for detail in trim_result.details:
