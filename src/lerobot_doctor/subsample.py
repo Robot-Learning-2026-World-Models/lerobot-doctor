@@ -413,7 +413,6 @@ def _rewrite_video_chunks(
             "-vf", vf,
             "-an",
             "-fps_mode", "passthrough",
-            "-r", str(target_fps),
             "-c:v", encoder,
             "-pix_fmt", "yuv420p",
             "-threads", str(ffmpeg_threads),
