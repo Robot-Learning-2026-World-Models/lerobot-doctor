@@ -373,7 +373,9 @@ def _rewrite_video_chunks(
 
     cpu_total = os.cpu_count() or workers
     effective_workers = max(1, min(workers, cpu_total))
-    ffmpeg_threads = max(1, cpu_total // effective_workers)
+    # libx265 rejects frame-threads >= 16 (X265_MAX_FRAME_THREADS); cap to stay safe
+    # across both x264 and x265 while still benefitting from intra-ffmpeg parallelism.
+    ffmpeg_threads = max(1, min(cpu_total // effective_workers, 8))
 
     step = source_fps // target_fps
 
