@@ -34,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--threshold", type=float, default=0.01)
     parser.add_argument("--min-active", type=int, default=10)
     parser.add_argument("--subsample-fps", type=int, default=None, help="Optional target FPS; must divide source FPS")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel ffmpeg workers for video subsampling (capped at cpu_count)")
     parser.add_argument("--private", action="store_true", help="Create the target Hub repo as private")
     parser.add_argument("--overwrite-local", action="store_true", help="Replace an existing local Downloads copy")
     parser.add_argument("--skip-upload", action="store_true", help="Stop after trimming and checks")
@@ -77,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         subsample_result = subsample_dataset(
             local_dir,
             target_fps=args.subsample_fps,
+            workers=args.workers,
             progress=lambda msg: print(f"  {msg}"),
         )
         for detail in subsample_result.details:

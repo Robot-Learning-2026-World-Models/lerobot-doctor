@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,8 +53,8 @@ class TableSubsamplePlan:
 class VideoSubsampleSlice:
     episode_index: int
     source_path: Path
-    start_ts: float
-    end_ts: float
+    start_frame: int
+    old_length: int
     new_length: int
 
 
@@ -61,6 +63,7 @@ def subsample_dataset(
     target_fps: int,
     subsample_videos: bool = True,
     dry_run: bool = False,
+    workers: int = 4,
     progress: Callable[[str], None] | None = None,
 ) -> SubsampleResult:
     """Subsample a local LeRobot dataset to a lower FPS."""
@@ -106,7 +109,9 @@ def subsample_dataset(
 
     if subsample_videos and video_rewrites:
         try:
-            encoder = _rewrite_video_chunks(video_rewrites, source_fps, target_fps, progress=progress)
+            encoder = _rewrite_video_chunks(
+                video_rewrites, source_fps, target_fps, workers=workers, progress=progress
+            )
             _update_video_codec(root, encoder, target_fps)
         except RuntimeError as e:
             result.details.append(f"Error: {e}")
@@ -262,16 +267,27 @@ def _build_video_plan(
                     f"episode {ep_idx} is missing videos/{feat_name}/from_timestamp or to_timestamp"
                 )
 
+            start_frame = int(round(float(from_ts) * source_fps))
+            end_frame = int(round(float(to_ts) * source_fps))
+            window_frames = end_frame - start_frame
+            if window_frames != plan.old_length:
+                raise RuntimeError(
+                    f"episode {ep_idx} videos/{feat_name} window has {window_frames} frames "
+                    f"(from_ts={from_ts}, to_ts={to_ts}, source_fps={source_fps}) but parquet has "
+                    f"{plan.old_length} rows; upstream metadata is inconsistent"
+                )
+
             video_path = _format_video_path(info["video_path"], feat_name, int(chunk_idx), int(file_idx))
             source_path = root / video_path
             if not source_path.exists():
                 raise RuntimeError(f"video file not found: {source_path}")
 
             grouped.setdefault(source_path, []).append(
-                VideoSubsampleSlice(ep_idx, source_path, float(from_ts), float(to_ts), plan.new_length)
+                VideoSubsampleSlice(ep_idx, source_path, start_frame, plan.old_length, plan.new_length)
             )
 
         for source_path, slices in grouped.items():
+            slices.sort(key=lambda s: s.episode_index)
             next_ts = 0.0
             rewrites[source_path] = slices
             for sl in slices:
@@ -286,69 +302,157 @@ def _rewrite_video_chunks(
     video_rewrites: dict[Path, list[VideoSubsampleSlice]],
     source_fps: int,
     target_fps: int,
+    workers: int,
     progress: Callable[[str], None] | None = None,
 ) -> str:
+    """Encode each episode slice independently, verify its frame count, then
+    concatenate the slices into the final chunk with the demuxer (no re-encode).
+
+    Per-slice encoding makes ffmpeg's output frame count deterministic and locally
+    checkable; demuxer concat with -c copy can never drop frames.
+    """
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg not found on PATH; cannot subsample videos")
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("ffprobe not found on PATH; cannot verify subsampled chunks")
 
     encoder = _choose_ffmpeg_encoder(ffmpeg)
     use_hwaccel = _has_videotoolbox_hwaccel(ffmpeg)
 
-    total = len(video_rewrites)
+    cpu_total = os.cpu_count() or workers
+    effective_workers = max(1, min(workers, cpu_total))
+    ffmpeg_threads = max(1, cpu_total // effective_workers)
+
     step = source_fps // target_fps
     select_expr = f"eq(mod(n\\,{step})\\,0)"
-    for chunk_i, (source_path, slices) in enumerate(video_rewrites.items(), start=1):
+
+    slice_jobs: list[tuple[Path, VideoSubsampleSlice]] = []
+    chunk_slices: dict[Path, list[Path]] = {}
+    for source_path, slices in video_rewrites.items():
         if not slices:
             continue
-        kept_frames = sum(sl.new_length for sl in slices)
-        source_mb = source_path.stat().st_size / (1024 * 1024) if source_path.exists() else 0.0
-        _emit(
-            progress,
-            f"Subsampling video chunk {chunk_i}/{total}: {source_path.name} "
-            f"({len(slices)} episode slices, {kept_frames} frames, {source_mb:.1f} MB)",
-        )
-        started = time.monotonic()
-        tmp_path = source_path.with_name(source_path.name + ".tmp.mp4")
-        filter_parts = []
-        labels = []
+        chunk_slices[source_path] = []
         for i, sl in enumerate(slices):
-            label = f"v{i}"
-            labels.append(f"[{label}]")
-            filter_parts.append(
-                f"[0:v]trim=start={sl.start_ts:.9f}:end={sl.end_ts:.9f},"
-                f"setpts=PTS-STARTPTS,select='{select_expr}',"
-                f"setpts=N/({target_fps}*TB)[{label}]"
-            )
-        filter_parts.append(f"{''.join(labels)}concat=n={len(slices)}:v=1:a=0[outv]")
+            slice_path = source_path.with_name(f"{source_path.stem}.slice_{i:04d}.mp4")
+            slice_jobs.append((slice_path, sl))
+            chunk_slices[source_path].append(slice_path)
 
+    _emit(
+        progress,
+        f"Encoding {len(slice_jobs)} episode slice(s) across {len(chunk_slices)} chunk(s) "
+        f"with {effective_workers} worker(s) (ffmpeg -threads {ffmpeg_threads}).",
+    )
+
+    def encode_slice(slice_path: Path, sl: VideoSubsampleSlice):
+        end_frame = sl.start_frame + sl.old_length
+        vf = (
+            f"trim=start_frame={sl.start_frame}:end_frame={end_frame},"
+            f"setpts=PTS-STARTPTS,select='{select_expr}',"
+            f"setpts=N/({target_fps}*TB)"
+        )
         cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
         if use_hwaccel:
             cmd.extend(["-hwaccel", "videotoolbox"])
         cmd.extend([
-            "-i", str(source_path),
-            "-filter_complex", ";".join(filter_parts),
-            "-map", "[outv]",
+            "-i", str(sl.source_path),
+            "-vf", vf,
             "-an",
+            "-fps_mode", "passthrough",
             "-r", str(target_fps),
             "-c:v", encoder,
             "-pix_fmt", "yuv420p",
+            "-threads", str(ffmpeg_threads),
         ])
         if "hevc" in encoder or "x265" in encoder:
             cmd.extend(["-tag:v", "hvc1"])
-        cmd.append(str(tmp_path))
-
+        cmd.append(str(slice_path))
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
-            tmp_path.replace(source_path)
-            elapsed = time.monotonic() - started
-            _emit(progress, f"Finished video chunk {chunk_i}/{total}: {source_path.name} in {_format_duration(elapsed)}")
         except subprocess.CalledProcessError as e:
-            if tmp_path.exists():
-                tmp_path.unlink()
+            slice_path.unlink(missing_ok=True)
             msg = e.stderr.strip() or e.stdout.strip() or str(e)
-            raise RuntimeError(f"ffmpeg failed for {source_path.name}: {msg}") from e
+            raise RuntimeError(
+                f"ffmpeg failed for episode {sl.episode_index} ({sl.source_path.name}): {msg}"
+            ) from e
+        actual = _count_frames(ffprobe, slice_path)
+        if actual != sl.new_length:
+            slice_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"episode {sl.episode_index} ({sl.source_path.name}) slice produced {actual} frames, "
+                f"expected {sl.new_length}"
+            )
+
+    started = time.monotonic()
+    completed = 0
+    progress_step = max(1, len(slice_jobs) // 20)
+    pending_error: BaseException | None = None
+    with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+        futures = {pool.submit(encode_slice, sp, sl): sp for sp, sl in slice_jobs}
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except BaseException as e:
+                pending_error = pending_error or e
+                continue
+            completed += 1
+            if completed % progress_step == 0 or completed == len(slice_jobs):
+                _emit(progress, f"  Encoded {completed}/{len(slice_jobs)} slice(s)")
+
+    if pending_error is not None:
+        for slice_paths in chunk_slices.values():
+            for p in slice_paths:
+                p.unlink(missing_ok=True)
+        raise pending_error
+
+    total_chunks = len(chunk_slices)
+    for chunk_i, (source_path, slice_paths) in enumerate(chunk_slices.items(), start=1):
+        _emit(
+            progress,
+            f"Concatenating chunk {chunk_i}/{total_chunks}: {source_path.name} ({len(slice_paths)} slice(s))",
+        )
+        _concat_slices(ffmpeg, slice_paths, source_path)
+        for p in slice_paths:
+            p.unlink(missing_ok=True)
+
+    elapsed = time.monotonic() - started
+    _emit(progress, f"Video subsampling finished in {_format_duration(elapsed)}")
     return encoder
+
+
+def _concat_slices(ffmpeg: str, slice_paths: list[Path], output_path: Path):
+    list_path = output_path.with_name(output_path.stem + ".concat.txt")
+    tmp_out = output_path.with_name(output_path.name + ".tmp.mp4")
+    list_path.write_text("".join(f"file '{p.resolve()}'\n" for p in slice_paths))
+    cmd = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "concat", "-safe", "0",
+        "-i", str(list_path),
+        "-c", "copy",
+        str(tmp_out),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        tmp_out.replace(output_path)
+    except subprocess.CalledProcessError as e:
+        tmp_out.unlink(missing_ok=True)
+        msg = e.stderr.strip() or e.stdout.strip() or str(e)
+        raise RuntimeError(f"ffmpeg concat failed for {output_path.name}: {msg}") from e
+    finally:
+        list_path.unlink(missing_ok=True)
+
+
+def _count_frames(ffprobe: str, video_path: Path) -> int:
+    proc = subprocess.run(
+        [
+            ffprobe, "-v", "error", "-select_streams", "v:0",
+            "-count_frames", "-show_entries", "stream=nb_read_frames",
+            "-of", "csv=p=0", str(video_path),
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    return int(proc.stdout.strip())
 
 
 def _update_metadata_after_subsample(
