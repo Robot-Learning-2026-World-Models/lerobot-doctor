@@ -8,8 +8,8 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 import pyarrow as pa
@@ -17,15 +17,12 @@ import pyarrow.parquet as pq
 
 from lerobot_doctor.trim import (
     _choose_ffmpeg_encoder,
-    _concat_slices,
-    _count_frames,
     _format_duration,
     _format_video_path,
     _has_videotoolbox_hwaccel,
-    _load_episode_meta_rows_all,
+    _load_episode_meta_rows,
     _load_fps,
     _load_info,
-    _parse_data_path,
 )
 
 
@@ -38,33 +35,11 @@ class SubsampleResult:
 
 
 @dataclass
-class EpisodeShard:
-    """One (episode, data_file) pair. Episodes can have multiple shards in LeRobot v2.1.
-
-    start_offset is the cumulative number of episode rows in earlier shards; it sets
-    the subsample cadence so frame selection stays continuous across shard boundaries.
-    """
-    episode_index: int
-    data_chunk_index: int
-    data_file_index: int
-    start_offset: int
-    old_length: int
-    new_length: int
-    global_from_index: int = 0  # post-subsample row index where this shard begins
-
-
-@dataclass
 class EpisodeSubsamplePlan:
     episode_index: int
-    shards: list[EpisodeShard] = field(default_factory=list)
-
-    @property
-    def old_length(self) -> int:
-        return sum(s.old_length for s in self.shards)
-
-    @property
-    def new_length(self) -> int:
-        return sum(s.new_length for s in self.shards)
+    old_length: int
+    new_length: int
+    rows_to_keep: list[int]
 
 
 @dataclass
@@ -76,18 +51,11 @@ class TableSubsamplePlan:
 
 @dataclass
 class VideoSubsampleSlice:
-    """One shard rendered as one ffmpeg invocation.
-
-    start_offset is the episode-global row offset before this shard so the
-    `select` filter can keep the same n,step cadence the parquet uses.
-    """
     episode_index: int
-    data_file_index: int
     source_path: Path
     start_frame: int
     old_length: int
     new_length: int
-    start_offset: int
 
 
 def subsample_dataset(
@@ -166,16 +134,12 @@ def _build_subsample_plan(
 
     step = source_fps // target_fps
     episode_offsets: dict[int, int] = {}
-    cursor = 0  # post-subsample global row index
 
     for pf in sorted(data_dir.rglob("*.parquet")):
         table = pq.read_table(pf)
         if "episode_index" not in table.column_names:
             table_plans.append(TableSubsamplePlan(pf, table, list(range(len(table)))))
-            cursor += len(table)
             continue
-
-        chunk_idx, file_idx = _parse_data_path(pf)
 
         ep_col = table.column("episode_index").to_pylist()
         episodes: dict[int, list[int]] = {}
@@ -192,30 +156,26 @@ def _build_subsample_plan(
                 if (start_offset + local_offset) % step == 0
             ]
             episode_offsets[ep_idx] = start_offset + len(row_indices)
-            rows_to_keep.extend(kept_rows)
 
-            shard = EpisodeShard(
-                episode_index=ep_idx,
-                data_chunk_index=chunk_idx,
-                data_file_index=file_idx,
-                start_offset=start_offset,
-                old_length=len(row_indices),
-                new_length=len(kept_rows),
-                global_from_index=cursor,
-            )
-            cursor += len(kept_rows)
-            episode_plans.setdefault(ep_idx, EpisodeSubsamplePlan(ep_idx)).shards.append(shard)
-            result.frames_removed += len(row_indices) - len(kept_rows)
+            old_length = len(row_indices)
+            new_length = len(kept_rows)
+            removed = old_length - new_length
+            rows_to_keep.extend(kept_rows)
+            if ep_idx not in episode_plans:
+                episode_plans[ep_idx] = EpisodeSubsamplePlan(ep_idx, 0, 0, [])
+            episode_plans[ep_idx].old_length += old_length
+            episode_plans[ep_idx].new_length += new_length
+            episode_plans[ep_idx].rows_to_keep.extend(kept_rows)
+            result.frames_removed += removed
 
         table_plans.append(TableSubsamplePlan(pf, table, rows_to_keep))
 
     for ep_idx in sorted(episode_plans):
         plan = episode_plans[ep_idx]
         if plan.old_length != plan.new_length:
-            shard_note = f" across {len(plan.shards)} shards" if len(plan.shards) > 1 else ""
             result.details.append(
                 f"Episode {ep_idx}: subsampled {plan.old_length} -> {plan.new_length} frames "
-                f"({source_fps}fps -> {target_fps}fps){shard_note}"
+                f"({source_fps}fps -> {target_fps}fps)"
             )
 
     return table_plans, episode_plans
@@ -270,7 +230,7 @@ def _build_video_plan(
     episode_plans: dict[int, EpisodeSubsamplePlan],
     source_fps: int,
     target_fps: int,
-) -> tuple[dict[Path, list[VideoSubsampleSlice]], dict[tuple[str, int, int], tuple[float, float]]]:
+) -> tuple[dict[Path, list[VideoSubsampleSlice]], dict[tuple[str, int], tuple[float, float]]]:
     info = _load_info(root)
     if not info:
         return {}, {}
@@ -282,68 +242,58 @@ def _build_video_plan(
     if not info.get("video_path"):
         raise RuntimeError("video features are declared but video_path is missing in info.json")
 
-    meta_rows = _load_episode_meta_rows_all(root)
+    meta_rows = _load_episode_meta_rows(root)
     if not meta_rows:
         raise RuntimeError("video subsampling requires meta/episodes parquet metadata")
 
+    chunks_size = info.get("chunks_size", 1000)
     rewrites: dict[Path, list[VideoSubsampleSlice]] = {}
-    windows: dict[tuple[str, int, int], tuple[float, float]] = {}
+    windows: dict[tuple[str, int], tuple[float, float]] = {}
 
     for feat_name in video_features:
-        feat_rewrites: dict[Path, list[VideoSubsampleSlice]] = {}
+        grouped: dict[Path, list[VideoSubsampleSlice]] = {}
         for ep_idx in sorted(episode_plans):
             plan = episode_plans[ep_idx]
-            for shard in plan.shards:
-                key = (ep_idx, shard.data_file_index)
-                raw = meta_rows.get(key)
-                if raw is None:
-                    raise RuntimeError(
-                        f"episode {ep_idx} shard data/file_index={shard.data_file_index} missing from meta/episodes"
-                    )
-                v_chunk = raw.get(f"videos/{feat_name}/chunk_index")
-                v_file = raw.get(f"videos/{feat_name}/file_index")
-                from_ts = raw.get(f"videos/{feat_name}/from_timestamp")
-                to_ts = raw.get(f"videos/{feat_name}/to_timestamp")
-                if v_chunk is None or v_file is None or from_ts is None or to_ts is None:
-                    raise RuntimeError(
-                        f"episode {ep_idx} shard data/file_index={shard.data_file_index} missing "
-                        f"videos/{feat_name} chunk_index/file_index/from_timestamp/to_timestamp"
-                    )
-                start_frame = int(round(float(from_ts) * source_fps))
-                end_frame = int(round(float(to_ts) * source_fps))
-                if end_frame - start_frame != shard.old_length:
-                    raise RuntimeError(
-                        f"episode {ep_idx} shard data/file_index={shard.data_file_index} "
-                        f"videos/{feat_name} window has {end_frame - start_frame} frames "
-                        f"(from_ts={from_ts}, to_ts={to_ts}, source_fps={source_fps}) but "
-                        f"parquet shard has {shard.old_length} rows"
-                    )
+            raw = meta_rows.get(ep_idx)
+            if raw is None:
+                raise RuntimeError(f"episode {ep_idx} is missing from meta/episodes")
 
-                video_path = _format_video_path(info["video_path"], feat_name, int(v_chunk), int(v_file))
-                source_path = root / video_path
-                if not source_path.exists():
-                    raise RuntimeError(f"video file not found: {source_path}")
-
-                feat_rewrites.setdefault(source_path, []).append(
-                    VideoSubsampleSlice(
-                        episode_index=ep_idx,
-                        data_file_index=shard.data_file_index,
-                        source_path=source_path,
-                        start_frame=start_frame,
-                        old_length=shard.old_length,
-                        new_length=shard.new_length,
-                        start_offset=shard.start_offset,
-                    )
+            chunk_idx = raw.get(f"videos/{feat_name}/chunk_index", ep_idx // chunks_size)
+            file_idx = raw.get(f"videos/{feat_name}/file_index", ep_idx)
+            from_ts = raw.get(f"videos/{feat_name}/from_timestamp")
+            to_ts = raw.get(f"videos/{feat_name}/to_timestamp")
+            if from_ts is None or to_ts is None:
+                raise RuntimeError(
+                    f"episode {ep_idx} is missing videos/{feat_name}/from_timestamp or to_timestamp"
                 )
 
-        for source_path, slices in feat_rewrites.items():
-            slices.sort(key=lambda s: (s.episode_index, s.data_file_index))
+            start_frame = int(round(float(from_ts) * source_fps))
+            end_frame = int(round(float(to_ts) * source_fps))
+            window_frames = end_frame - start_frame
+            if window_frames != plan.old_length:
+                raise RuntimeError(
+                    f"episode {ep_idx} videos/{feat_name} window has {window_frames} frames "
+                    f"(from_ts={from_ts}, to_ts={to_ts}, source_fps={source_fps}) but parquet has "
+                    f"{plan.old_length} rows; upstream metadata is inconsistent"
+                )
+
+            video_path = _format_video_path(info["video_path"], feat_name, int(chunk_idx), int(file_idx))
+            source_path = root / video_path
+            if not source_path.exists():
+                raise RuntimeError(f"video file not found: {source_path}")
+
+            grouped.setdefault(source_path, []).append(
+                VideoSubsampleSlice(ep_idx, source_path, start_frame, plan.old_length, plan.new_length)
+            )
+
+        for source_path, slices in grouped.items():
+            slices.sort(key=lambda s: s.episode_index)
             next_ts = 0.0
+            rewrites[source_path] = slices
             for sl in slices:
                 end_ts = next_ts + sl.new_length / target_fps
-                windows[(feat_name, sl.episode_index, sl.data_file_index)] = (next_ts, end_ts)
+                windows[(feat_name, sl.episode_index)] = (next_ts, end_ts)
                 next_ts = end_ts
-            rewrites[source_path] = slices
 
     return rewrites, windows
 
@@ -355,7 +305,7 @@ def _rewrite_video_chunks(
     workers: int,
     progress: Callable[[str], None] | None = None,
 ) -> str:
-    """Encode each shard slice independently, verify its frame count, then
+    """Encode each episode slice independently, verify its frame count, then
     concatenate the slices into the final chunk with the demuxer (no re-encode).
 
     Per-slice encoding makes ffmpeg's output frame count deterministic and locally
@@ -373,11 +323,10 @@ def _rewrite_video_chunks(
 
     cpu_total = os.cpu_count() or workers
     effective_workers = max(1, min(workers, cpu_total))
-    # libx265 rejects frame-threads >= 16 (X265_MAX_FRAME_THREADS); cap to stay safe
-    # across both x264 and x265 while still benefitting from intra-ffmpeg parallelism.
-    ffmpeg_threads = max(1, min(cpu_total // effective_workers, 8))
+    ffmpeg_threads = max(1, min(cpu_total // effective_workers, 4))
 
     step = source_fps // target_fps
+    select_expr = f"eq(mod(n\\,{step})\\,0)"
 
     slice_jobs: list[tuple[Path, VideoSubsampleSlice]] = []
     chunk_slices: dict[Path, list[Path]] = {}
@@ -392,19 +341,18 @@ def _rewrite_video_chunks(
 
     _emit(
         progress,
-        f"Encoding {len(slice_jobs)} shard slice(s) across {len(chunk_slices)} chunk(s) "
+        f"Encoding {len(slice_jobs)} episode slice(s) across {len(chunk_slices)} chunk(s) "
         f"with {effective_workers} worker(s) (ffmpeg -threads {ffmpeg_threads}).",
     )
 
-    def encode_slice(slice_path: Path, sl: VideoSubsampleSlice):
+    # Pre-build cmds in the parent so worker processes only need the cmd list
+    # plus the verification metadata (everything picklable, no closures).
+    tasks: list[tuple] = []
+    for slice_path, sl in slice_jobs:
         end_frame = sl.start_frame + sl.old_length
-        # Keep frames where (n + start_offset) % step == 0 so the cadence stays
-        # continuous when an episode spans multiple shards.
-        offset = sl.start_offset % step
-        select_expr_local = f"eq(mod(n+{offset}\\,{step})\\,0)"
         vf = (
             f"trim=start_frame={sl.start_frame}:end_frame={end_frame},"
-            f"setpts=PTS-STARTPTS,select='{select_expr_local}',"
+            f"setpts=PTS-STARTPTS,select='{select_expr}',"
             f"setpts=N/({target_fps}*TB)"
         )
         cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
@@ -414,38 +362,28 @@ def _rewrite_video_chunks(
             "-i", str(sl.source_path),
             "-vf", vf,
             "-an",
-            "-fps_mode", "passthrough",
+            "-r", str(target_fps),
             "-c:v", encoder,
             "-pix_fmt", "yuv420p",
-            "-bf", "0",
             "-threads", str(ffmpeg_threads),
         ])
         if "hevc" in encoder or "x265" in encoder:
             cmd.extend(["-tag:v", "hvc1"])
+            cmd.extend(["-preset", "ultrafast"])
+        elif "x264" in encoder:
+            cmd.extend(["-preset", "ultrafast"])
         cmd.append(str(slice_path))
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            slice_path.unlink(missing_ok=True)
-            msg = e.stderr.strip() or e.stdout.strip() or str(e)
-            raise RuntimeError(
-                f"ffmpeg failed for episode {sl.episode_index} shard data/file_index={sl.data_file_index} "
-                f"({sl.source_path.name}): {msg}"
-            ) from e
-        actual = _count_frames(ffprobe, slice_path)
-        if actual != sl.new_length:
-            slice_path.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"episode {sl.episode_index} shard data/file_index={sl.data_file_index} "
-                f"({sl.source_path.name}) slice produced {actual} frames, expected {sl.new_length}"
-            )
+        tasks.append((
+            cmd, str(slice_path), ffprobe, sl.new_length,
+            sl.episode_index, sl.source_path.name, sl.start_frame, end_frame,
+        ))
 
     started = time.monotonic()
     completed = 0
     progress_step = max(1, len(slice_jobs) // 20)
     pending_error: BaseException | None = None
-    with ThreadPoolExecutor(max_workers=effective_workers) as pool:
-        futures = {pool.submit(encode_slice, sp, sl): sp for sp, sl in slice_jobs}
+    with ProcessPoolExecutor(max_workers=effective_workers) as pool:
+        futures = [pool.submit(_run_subsample_slice, t) for t in tasks]
         for fut in as_completed(futures):
             try:
                 fut.result()
@@ -477,10 +415,78 @@ def _rewrite_video_chunks(
     return encoder
 
 
+def _concat_slices(ffmpeg: str, slice_paths: list[Path], output_path: Path):
+    list_path = output_path.with_name(output_path.stem + ".concat.txt")
+    tmp_out = output_path.with_name(output_path.name + ".tmp.mp4")
+    list_path.write_text("".join(f"file '{p.resolve()}'\n" for p in slice_paths))
+    cmd = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "concat", "-safe", "0",
+        "-i", str(list_path),
+        "-c", "copy",
+        str(tmp_out),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        tmp_out.replace(output_path)
+    except subprocess.CalledProcessError as e:
+        tmp_out.unlink(missing_ok=True)
+        msg = e.stderr.strip() or e.stdout.strip() or str(e)
+        raise RuntimeError(f"ffmpeg concat failed for {output_path.name}: {msg}") from e
+    finally:
+        list_path.unlink(missing_ok=True)
+
+
+def _run_subsample_slice(task: tuple) -> None:
+    """Module-level worker invoked by ProcessPoolExecutor (picklable)."""
+    cmd, slice_path_s, ffprobe, expected, ep_idx, source_name, start_frame, end_frame = task
+    slice_path = Path(slice_path_s)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        slice_path.unlink(missing_ok=True)
+        msg = e.stderr.strip() or e.stdout.strip() or str(e)
+        raise RuntimeError(
+            f"ffmpeg failed for episode {ep_idx} ({source_name}, "
+            f"start_frame={start_frame}, end_frame={end_frame}): {msg}"
+        ) from e
+    actual = _count_frames(ffprobe, slice_path)
+    if actual != expected:
+        # Probe the source video so the error tells us if the source is short
+        # rather than the filter dropping frames.
+        try:
+            source_path = Path(cmd[cmd.index("-i") + 1])
+            source_total = _count_frames(ffprobe, source_path)
+        except Exception:
+            source_total = -1
+        slice_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"episode {ep_idx} ({source_name}) slice produced {actual} frames, "
+            f"expected {expected} (source range [{start_frame},{end_frame}), "
+            f"source total frames = {source_total})"
+        )
+
+
+def _count_frames(ffprobe: str, video_path) -> int:
+    p = Path(video_path)
+    if not p.exists() or p.stat().st_size == 0:
+        return 0
+    proc = subprocess.run(
+        [
+            ffprobe, "-v", "error", "-select_streams", "v:0",
+            "-count_frames", "-show_entries", "stream=nb_read_frames",
+            "-of", "csv=p=0", str(p),
+        ],
+        check=False, capture_output=True, text=True,
+    )
+    out = proc.stdout.strip()
+    return int(out) if out.isdigit() else 0
+
+
 def _update_metadata_after_subsample(
     root: Path,
     episode_plans: dict[int, EpisodeSubsamplePlan],
-    video_windows: dict[tuple[str, int, int], tuple[float, float]],
+    video_windows: dict[tuple[str, int], tuple[float, float]],
     target_fps: int,
 ):
     _update_info(root, episode_plans, target_fps)
@@ -519,69 +525,72 @@ def _update_video_codec(root: Path, encoder: str, target_fps: int):
 def _update_episode_metadata(
     root: Path,
     episode_plans: dict[int, EpisodeSubsamplePlan],
-    video_windows: dict[tuple[str, int, int], tuple[float, float]],
+    video_windows: dict[tuple[str, int], tuple[float, float]],
 ):
-    """Update each meta row in place; multi-shard episodes keep one row per shard."""
     meta_dir = root / "meta" / "episodes"
     if not meta_dir.exists():
         return
 
-    shard_lookup: dict[tuple[int, int], EpisodeShard] = {}
-    for plan in episode_plans.values():
-        for shard in plan.shards:
-            shard_lookup[(shard.episode_index, shard.data_file_index)] = shard
+    global_from: dict[int, int] = {}
+    cursor = 0
+    for ep_idx in sorted(episode_plans):
+        plan = episode_plans[ep_idx]
+        global_from[ep_idx] = cursor
+        cursor += plan.new_length
 
+    seen_episodes: set[int] = set()
     for pf in sorted(meta_dir.rglob("*.parquet")):
         table = pq.read_table(pf)
         if "episode_index" not in table.column_names:
             continue
         ep_col = [int(ep) for ep in table.column("episode_index").to_pylist()]
-        if "data/file_index" in table.column_names:
-            df_col = [int(df) for df in table.column("data/file_index").to_pylist()]
-        else:
-            df_col = ep_col[:]
+        keep_rows = []
+        for i, ep in enumerate(ep_col):
+            if ep in seen_episodes:
+                continue
+            keep_rows.append(i)
+            seen_episodes.add(ep)
+        if len(keep_rows) < len(table):
+            if keep_rows:
+                table = table.take(keep_rows)
+            else:
+                table = table.slice(0, 0)
+            ep_col = [int(ep) for ep in table.column("episode_index").to_pylist()] if len(table) else []
         if len(table) == 0:
+            pq.write_table(table, pf)
             continue
 
         updates: dict[str, list] = {}
-
-        def shard_for(i: int) -> EpisodeShard | None:
-            return shard_lookup.get((ep_col[i], df_col[i]))
-
         if "length" in table.column_names:
-            col = table.column("length")
             updates["length"] = [
-                shard_for(i).new_length if shard_for(i) is not None else col[i].as_py()
-                for i in range(len(table))
+                episode_plans[ep].new_length if ep in episode_plans else table.column("length")[i].as_py()
+                for i, ep in enumerate(ep_col)
             ]
         if "dataset_from_index" in table.column_names:
-            col = table.column("dataset_from_index")
             updates["dataset_from_index"] = [
-                shard_for(i).global_from_index if shard_for(i) is not None else col[i].as_py()
-                for i in range(len(table))
+                global_from.get(ep, table.column("dataset_from_index")[i].as_py())
+                for i, ep in enumerate(ep_col)
             ]
         if "dataset_to_index" in table.column_names:
-            col = table.column("dataset_to_index")
-            vals = []
-            for i in range(len(table)):
-                sh = shard_for(i)
-                vals.append(sh.global_from_index + sh.new_length if sh is not None else col[i].as_py())
-            updates["dataset_to_index"] = vals
+            updates["dataset_to_index"] = [
+                global_from[ep] + episode_plans[ep].new_length
+                if ep in episode_plans else table.column("dataset_to_index")[i].as_py()
+                for i, ep in enumerate(ep_col)
+            ]
 
-        for col_name in table.column_names:
-            if not col_name.startswith("videos/") or not col_name.endswith(("/from_timestamp", "/to_timestamp")):
+        for col in table.column_names:
+            if not col.startswith("videos/") or not col.endswith(("/from_timestamp", "/to_timestamp")):
                 continue
-            feature = col_name.removeprefix("videos/").rsplit("/", 1)[0]
-            is_from = col_name.endswith("/from_timestamp")
-            col = table.column(col_name)
-            vals = []
-            for i in range(len(table)):
-                window = video_windows.get((feature, ep_col[i], df_col[i]))
-                vals.append((window[0] if is_from else window[1]) if window else col[i].as_py())
-            updates[col_name] = vals
+            feature = col.removeprefix("videos/").rsplit("/", 1)[0]
+            is_from = col.endswith("/from_timestamp")
+            values = []
+            for i, ep in enumerate(ep_col):
+                window = video_windows.get((feature, ep))
+                values.append((window[0] if is_from else window[1]) if window else table.column(col)[i].as_py())
+            updates[col] = values
 
-        for col_name, values in updates.items():
-            table = table.set_column(table.column_names.index(col_name), col_name, pa.array(values))
+        for col, values in updates.items():
+            table = table.set_column(table.column_names.index(col), col, pa.array(values))
         pq.write_table(table, pf)
 
 

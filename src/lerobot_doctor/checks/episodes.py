@@ -97,13 +97,16 @@ def check_episodes(dataset: LoadedDataset) -> CheckResult:
             )
             break  # only warn about the smallest problematic chunk size
 
-    # Episode length consistency with metadata
+    # Episode length consistency with metadata.
+    # Multi-shard episodes have one meta row per (episode, data_file); sum lengths.
     if dataset.episodes_meta:
+        meta_lengths: dict[int, int] = {}
+        for m in dataset.episodes_meta:
+            meta_lengths[m.episode_index] = meta_lengths.get(m.episode_index, 0) + m.length
         mismatches = []
         for ep_data in dataset.episodes_data:
-            matching_meta = [m for m in dataset.episodes_meta if m.episode_index == ep_data.episode_index]
-            if matching_meta:
-                meta_len = matching_meta[0].length
+            if ep_data.episode_index in meta_lengths:
+                meta_len = meta_lengths[ep_data.episode_index]
                 if meta_len != ep_data.length:
                     mismatches.append((ep_data.episode_index, ep_data.length, meta_len))
         if mismatches:

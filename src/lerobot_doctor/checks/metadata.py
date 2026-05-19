@@ -72,12 +72,17 @@ def check_metadata(dataset: LoadedDataset) -> CheckResult:
             result.pass_(
                 f"Skipped total_episodes check (loaded partial subset via --max-episodes={dataset.max_episodes_applied})"
             )
-        elif info.total_episodes is not None and len(dataset.episodes_meta) != info.total_episodes:
-            result.fail(
-                f"total_episodes={info.total_episodes} but found {len(dataset.episodes_meta)} episode metadata entries"
-            )
         else:
-            result.pass_(f"Episode count matches: {info.total_episodes}")
+            # LeRobot v2.1: episodes spanning multiple data files have one meta
+            # row per (episode, data_file) shard; count unique episodes.
+            unique_eps = len({m.episode_index for m in dataset.episodes_meta})
+            if info.total_episodes is not None and unique_eps != info.total_episodes:
+                result.fail(
+                    f"total_episodes={info.total_episodes} but found {unique_eps} unique episode(s) "
+                    f"in meta ({len(dataset.episodes_meta)} shard row(s) total)"
+                )
+            else:
+                result.pass_(f"Episode count matches: {info.total_episodes}")
 
     # Check feature columns exist in data
     if dataset.episodes_data:
