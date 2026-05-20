@@ -845,6 +845,7 @@ def _write_v21_info(
     total_tasks: int,
     total_videos: int,
     encoder: str,
+    trim_chunk_size: int = 1,
 ):
     is_hevc = "hevc" in encoder or "x265" in encoder
     features = json.loads(json.dumps(source_info.get("features", {})))  # deep copy
@@ -869,6 +870,9 @@ def _write_v21_info(
         "video_path": V21_VIDEO_PATH,
         "features": features,
     }
+    if trim_chunk_size > 1:
+        # Non-standard bookkeeping field: idle-trim granularity in frames at target fps.
+        info["trim_chunk_size"] = trim_chunk_size
     (root / "meta/info.json").write_text(json.dumps(info, indent=2))
 
 
@@ -976,11 +980,37 @@ def _delete_v3_artifacts(root: Path, source_info: dict):
                     d.rmdir()
 
 
+def _snap_plans_to_chunks(episode_plans, chunk_size: int) -> None:
+    """Round each surviving episode's trim window to chunk boundaries (in-place).
+
+    start → floor to nearest chunk boundary (keeps the chunk containing the first
+            active frame, so no active frame is ever cut).
+    end   → ceiling to nearest chunk boundary, capped at old_length (keeps the
+            chunk containing the last active frame).
+    """
+    if chunk_size <= 1:
+        return
+    for plan in episode_plans.values():
+        if plan.dropped:
+            continue
+        plan.start = (plan.start // chunk_size) * chunk_size
+        plan.end = min(
+            ((plan.end + chunk_size - 1) // chunk_size) * chunk_size,
+            plan.old_length,
+        )
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("repo_id")
     p.add_argument("--output-parent", default=str(Path.home() / "Downloads"))
-    p.add_argument("--subsample-fps", type=int, required=True)
+    p.add_argument("--subsample-fps", type=int, default=None,
+                   help="Downsample to this FPS (must divide source FPS). "
+                        "Omit to keep original FPS.")
+    p.add_argument("--trim-chunk-size", type=int, default=1,
+                   help="Trim granularity in frames at target FPS (default 1 = per-frame). "
+                        "Must divide target FPS. Episodes are tiled into non-overlapping "
+                        "chunks of this size; only whole chunks are removed from idle edges.")
     p.add_argument("--threshold", type=float, default=0.05)
     p.add_argument("--min-active", type=int, default=10)
     p.add_argument("--workers", type=int, default=8)
@@ -1012,8 +1042,18 @@ def main(argv=None) -> int:
 
     info = _load_info(local_dir)
     source_fps = _load_fps(local_dir)
-    if source_fps is None or args.subsample_fps <= 0 or source_fps % args.subsample_fps != 0:
-        print(f"  ERROR: invalid fps ({source_fps} -> {args.subsample_fps})", file=sys.stderr)
+    if source_fps is None:
+        print(f"  ERROR: could not determine source FPS", file=sys.stderr)
+        return 2
+    if args.subsample_fps is not None:
+        if args.subsample_fps <= 0 or source_fps % args.subsample_fps != 0:
+            print(f"  ERROR: invalid --subsample-fps ({source_fps} -> {args.subsample_fps}); "
+                  f"must be a positive divisor of source FPS", file=sys.stderr)
+            return 2
+    target_fps = args.subsample_fps if args.subsample_fps is not None else source_fps
+    if args.trim_chunk_size < 1 or target_fps % args.trim_chunk_size != 0:
+        print(f"  ERROR: --trim-chunk-size {args.trim_chunk_size} must be a positive divisor "
+              f"of target FPS {target_fps}", file=sys.stderr)
         return 2
     old_video_path_template = info["video_path"]
 
@@ -1029,11 +1069,16 @@ def main(argv=None) -> int:
     if n_reconciled:
         print(f"  {n_reconciled} episode(s) reconciled; dataset is now single-shard.")
 
-    print(f"\n[3a/8] Subsampling action parquets in place ({source_fps}fps → {args.subsample_fps}fps)...")
-    sub_lengths = _subsample_data_parquets_in_place(local_dir, source_fps, args.subsample_fps)
-    print(f"  {len(sub_lengths)} episodes subsampled; total kept rows = {sum(sub_lengths.values())}")
+    if args.subsample_fps is not None:
+        print(f"\n[3a/8] Subsampling action parquets in place ({source_fps}fps → {target_fps}fps)...")
+        sub_lengths = _subsample_data_parquets_in_place(local_dir, source_fps, target_fps)
+        print(f"  {len(sub_lengths)} episodes subsampled; total kept rows = {sum(sub_lengths.values())}")
+    else:
+        print(f"\n[3a/8] Subsampling skipped (--subsample-fps not set; keeping {source_fps}fps).")
 
-    print(f"\n[3b/8] Planning idle-trim on subsampled data (threshold={args.threshold}, min_active={args.min_active})...")
+    chunk_desc = (f"chunk-size={args.trim_chunk_size} frames" if args.trim_chunk_size > 1
+                  else "frame-level")
+    print(f"\n[3b/8] Planning idle-trim ({chunk_desc}, threshold={args.threshold}, min_active={args.min_active})...")
     from lerobot_doctor.trim import TrimResult
     tres = TrimResult(0, 0, 0, [])
     table_plans, episode_plans = _build_trim_plan(
@@ -1041,11 +1086,12 @@ def main(argv=None) -> int:
         action_threshold=args.threshold,
         min_active_frames=args.min_active,
         trim_start=True, trim_end=True, remove_fully_static=True,
-        fps=args.subsample_fps, result=tres,  # plans are now in subsampled units
+        fps=target_fps, result=tres,
     )
+    _snap_plans_to_chunks(episode_plans, args.trim_chunk_size)
     n_kept = sum(1 for p in episode_plans.values() if not p.dropped)
     n_dropped = sum(1 for p in episode_plans.values() if p.dropped)
-    print(f"  {n_kept} kept, {n_dropped} dropped, {tres.frames_removed} frames trimmed (target-fps units)")
+    print(f"  {n_kept} kept, {n_dropped} dropped, {tres.frames_removed} frames trimmed ({target_fps}fps units)")
 
     encoder = _choose_ffmpeg_encoder(ffmpeg)
     cpu_total = os.cpu_count() or args.workers
@@ -1063,7 +1109,7 @@ def main(argv=None) -> int:
 
     print(f"\n[4/7] Encoding per-episode videos: {effective_workers} workers × {threads} ffmpeg threads, encoder={encoder}")
     jobs, expected = _build_jobs(
-        local_dir, episode_plans, meta_rows, info, source_fps, args.subsample_fps,
+        local_dir, episode_plans, meta_rows, info, source_fps, target_fps,
         ffmpeg, ffprobe, encoder, threads,
     )
     new_lengths_by_feat: dict[int, dict[str, int]] = {}
@@ -1092,7 +1138,7 @@ def main(argv=None) -> int:
 
     print(f"\n[6/8] Splitting data parquets into per-episode parquets...")
     total_frames = _write_per_ep_parquets(
-        local_dir, episode_plans, renumber, source_fps, args.subsample_fps, new_lengths
+        local_dir, episode_plans, renumber, source_fps, target_fps, new_lengths
     )
     print(f"  {total_frames} rows total")
 
@@ -1101,12 +1147,13 @@ def main(argv=None) -> int:
     _write_v21_stats(local_dir)
     total_videos = len(renumber) * len(video_feats)
     _write_v21_info(
-        local_dir, info, args.subsample_fps,
+        local_dir, info, target_fps,
         total_episodes=len(renumber),
         total_frames=total_frames,
         total_tasks=total_tasks,
         total_videos=total_videos,
         encoder=encoder,
+        trim_chunk_size=args.trim_chunk_size,
     )
     _delete_v3_artifacts(local_dir, info)
 
@@ -1141,10 +1188,12 @@ def main(argv=None) -> int:
     return 0
 
 
-def _trimmed_repo_id(repo_id: str, fps: int) -> str:
+def _trimmed_repo_id(repo_id: str, fps: int | None) -> str:
     if "/" not in repo_id:
         raise SystemExit("repo_id must be namespace/name")
     ns, name = repo_id.split("/", 1)
+    if fps is None:
+        return f"{ns}/{name}-trimmed"
     return f"{ns}/{name}-trimmed-subsampled-{fps}fps"
 
 
